@@ -113,6 +113,12 @@ module "eks" {
   manage_aws_auth               = false
   write_kubeconfig              = false
   tags                          = var.labels
+  tags                          = var.labels
+  create_fargate_pod_execution_role = true
+  fargate_profiles = {
+    default = { namespace = "default" }
+    kubesystem = { namespace = "kube-system" }
+  }
 }
 
 data "aws_eks_cluster" "main" {
@@ -122,22 +128,6 @@ data "aws_eks_cluster" "main" {
 data "aws_eks_cluster_auth" "main" {
   name = module.eks.cluster_id
 }
-
-resource "aws_iam_role" "iam_role_fargate" {
-  name = "eks-fargate-profile-${local.cluster_name}"
-  tags = var.labels
-  assume_role_policy = jsonencode({
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "eks-fargate-pods.amazonaws.com"
-      }
-    }]
-    Version = "2012-10-17"
-  })
-}
-
 
 # -----------------------------------------------------------------------------------
 # Fargate Logging Policy and Policy Attachment for the existing Fargate pod execution IAM role
@@ -168,31 +158,6 @@ resource "aws_iam_role_policy_attachment" "AmazonEKSFargateLoggingPolicy" {
 
 # --------------------------------------------------------------------------------------------
 
-resource "aws_iam_role_policy_attachment" "AmazonEKSFargatePodExecutionRolePolicy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy"
-  role       = aws_iam_role.iam_role_fargate.name
-}
-
-resource "aws_eks_fargate_profile" "default_namespaces" {
-  depends_on             = [module.eks]
-  cluster_name           = data.aws_eks_cluster.main.name
-  fargate_profile_name   = "default-namespaces-${local.cluster_name}"
-  pod_execution_role_arn = aws_iam_role.iam_role_fargate.arn
-  subnet_ids             = module.vpc.aws_subnet_private_prod_ids
-  tags                   = var.labels
-  timeouts {
-    # For reasons unknown, Fargate profiles can take upward of 20 minutes to
-    # delete! I've never seen them go past 30m, though, so this seems OK.
-    delete = "30m"
-  }
-  selector {
-    namespace = "default"
-  }
-  selector {
-    namespace = "kube-system"
-  }
-}
-
 # Per AWS docs, you have to patch the coredns deployment to remove the
 # constraint that it wants to run on ec2, then restart it.
 resource "null_resource" "coredns_restart_on_fargate" {
@@ -217,7 +182,6 @@ resource "null_resource" "coredns_restart_on_fargate" {
   }
   depends_on = [
     module.eks.cluster_id,
-    aws_eks_fargate_profile.default_namespaces
   ]
 }
 
@@ -265,7 +229,6 @@ resource "null_resource" "namespace_fargate_logging" {
   }
   depends_on = [
     null_resource.coredns_restart_on_fargate,
-    aws_eks_fargate_profile.default_namespaces
   ]
 }
 
@@ -283,22 +246,20 @@ resource "aws_iam_openid_connect_provider" "cluster" {
 }
 
 provider "kubernetes" {
+  version = "~> 2.0.1"
   host                   = data.aws_eks_cluster.main.endpoint
   cluster_ca_certificate = base64decode(data.aws_eks_cluster.main.certificate_authority[0].data)
-  load_config_file       = false
   exec {
     api_version = "client.authentication.k8s.io/v1alpha1"
     args        = ["token", "--cluster-id", data.aws_eks_cluster.main.id]
     command     = "aws-iam-authenticator"
   }
-  version = "~> 1.13.3"
 }
 
 provider "helm" {
   kubernetes {
     host                   = data.aws_eks_cluster.main.endpoint
     cluster_ca_certificate = base64decode(data.aws_eks_cluster.main.certificate_authority[0].data)
-    load_config_file       = false
     config_path            = "./kubeconfig_${module.eks.cluster_id}"
     exec {
       api_version = "client.authentication.k8s.io/v1alpha1"
@@ -306,10 +267,7 @@ provider "helm" {
       command     = "aws-iam-authenticator"
     }
   }
-  # Helm 2.0.1 seems to have issues with alias. When alias is removed the helm_release provider working
-  # Using Helm < 2.0.1 version seem to solve the issue.
-  # version = "~> 1.2"
-  version = "1.2.0"
+  version = "~> 2.0.2"
 }
 
 data "aws_region" "current" {}
@@ -406,7 +364,6 @@ resource "time_sleep" "alb_controller_destroy_delay" {
 }
 
 resource "kubernetes_ingress" "alb_to_nginx" {
-  wait_for_load_balancer = true
   metadata {
     name      = "alb-ingress-to-nginx-ingress"
     namespace = "kube-system"
@@ -526,7 +483,7 @@ resource "aws_route53_record" "www" {
   type    = "A"
 
   alias {
-    name                   = kubernetes_ingress.alb_to_nginx.load_balancer_ingress.0.hostname
+    name                   = kubernetes_ingress.alb_to_nginx.status[0].load_balancer[0].ingress[0].hostname
     zone_id                = data.aws_elb_hosted_zone_id.elb_zone_id.id
     evaluate_target_health = true
   }
